@@ -1,0 +1,16 @@
+# Security scan outputs (these are generated, not tracked)
+security-dashboard.html
+security-report.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node (for testing the template)
+node_modules/

@@ -1,0 +1,14 @@
+{
+  "projectName": "My Project",
+  "packageManager": "auto",
+  "testCommand": "test",
+  "excludePaths": ["node_modules", "dist", ".git", "coverage", "build", ".next"],
+  "semgrepConfig": "auto",
+  "generateJson": true,
+  "openDashboard": true,
+  "thresholds": {
+    "maxCritical": 0,
+    "maxHigh": 5,
+    "maxMedium": 20
+  }
+}

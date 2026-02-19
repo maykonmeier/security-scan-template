@@ -1,0 +1,173 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  schedule:
+    # Run every Monday at 6:00 AM UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip running tests'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect package manager
+        id: detect-pm
+        run: |
+          if [ -f "bun.lockb" ]; then
+            echo "manager=bun" >> $GITHUB_OUTPUT
+          elif [ -f "pnpm-lock.yaml" ]; then
+            echo "manager=pnpm" >> $GITHUB_OUTPUT
+          elif [ -f "yarn.lock" ]; then
+            echo "manager=yarn" >> $GITHUB_OUTPUT
+          else
+            echo "manager=npm" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Setup pnpm
+        if: steps.detect-pm.outputs.manager == 'pnpm'
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Setup Bun
+        if: steps.detect-pm.outputs.manager == 'bun'
+        uses: oven-sh/setup-bun@v2
+
+      - name: Get cache directory
+        id: cache-dir
+        run: |
+          case "${{ steps.detect-pm.outputs.manager }}" in
+            pnpm)
+              echo "dir=$(pnpm store path)" >> $GITHUB_OUTPUT
+              ;;
+            yarn)
+              echo "dir=$(yarn cache dir)" >> $GITHUB_OUTPUT
+              ;;
+            bun)
+              echo "dir=~/.bun/install/cache" >> $GITHUB_OUTPUT
+              ;;
+            *)
+              echo "dir=~/.npm" >> $GITHUB_OUTPUT
+              ;;
+          esac
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.cache-dir.outputs.dir }}
+          key: ${{ runner.os }}-${{ steps.detect-pm.outputs.manager }}-${{ hashFiles('**/package-lock.json', '**/pnpm-lock.yaml', '**/yarn.lock', '**/bun.lockb') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ steps.detect-pm.outputs.manager }}-
+
+      - name: Install dependencies
+        run: |
+          case "${{ steps.detect-pm.outputs.manager }}" in
+            pnpm) pnpm install --frozen-lockfile ;;
+            yarn) yarn install --frozen-lockfile ;;
+            bun) bun install --frozen-lockfile ;;
+            *) npm ci ;;
+          esac
+
+      - name: Install Semgrep
+        run: pip install semgrep
+
+      - name: Run security scan
+        id: scan
+        env:
+          SKIP_TESTS: ${{ github.event.inputs.skip_tests }}
+        run: |
+          if [ "$SKIP_TESTS" == "true" ]; then
+            bash security/scan.sh --ci --no-tests
+          else
+            bash security/scan.sh --ci
+          fi
+
+      - name: Upload security report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: security-report
+          path: |
+            security-report.json
+            security-dashboard.html
+          retention-days: 30
+
+      - name: Upload to GitHub Security (SARIF)
+        if: always() && hashFiles('security-report.json') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        continue-on-error: true
+        with:
+          sarif_file: security-report.json
+
+      - name: Comment on PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+
+            let report;
+            try {
+              report = JSON.parse(fs.readFileSync('security-report.json', 'utf8'));
+            } catch (e) {
+              console.log('Could not read security report');
+              return;
+            }
+
+            const { summary, tests, thresholdsPassed } = report;
+            const status = thresholdsPassed ? '✅' : '❌';
+            const testStatus = tests.status === 'passed' ? '✅' : tests.status === 'skipped' ? '⏭️' : '❌';
+
+            const body = `## ${status} Security Scan Results
+
+            | Severity | Count | Threshold |
+            |----------|-------|-----------|
+            | 🚨 Critical | ${summary.critical} | ${report.thresholds.maxCritical} |
+            | ⚠️ High | ${summary.high} | ${report.thresholds.maxHigh} |
+            | 📋 Medium | ${summary.medium} | ${report.thresholds.maxMedium} |
+            | ℹ️ Low | ${summary.low} | - |
+
+            ### ${testStatus} Tests
+            - Passed: ${tests.passed}
+            - Failed: ${tests.failed}
+
+            ${thresholdsPassed ? '✅ All security thresholds passed!' : '❌ Security thresholds exceeded - please review the findings.'}
+
+            <details>
+            <summary>View full report</summary>
+
+            Download the security-dashboard.html artifact for detailed results.
+
+            </details>
+            `;
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });

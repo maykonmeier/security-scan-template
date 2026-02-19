@@ -1,0 +1,51 @@
+# Dependencies
+node_modules/
+vendor/
+
+# Build outputs
+dist/
+build/
+.next/
+out/
+
+# Test and coverage
+coverage/
+__tests__/
+*.test.ts
+*.test.tsx
+*.test.js
+*.test.jsx
+*.spec.ts
+*.spec.tsx
+*.spec.js
+*.spec.jsx
+
+# Config files
+*.config.js
+*.config.ts
+vite.config.*
+vitest.config.*
+tailwind.config.*
+postcss.config.*
+eslint.config.*
+prettier.config.*
+
+# Generated files
+*.min.js
+*.bundle.js
+*.generated.*
+
+# Lock files
+pnpm-lock.yaml
+package-lock.json
+yarn.lock
+bun.lockb
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Security outputs (don't scan our own reports)
+security-dashboard.html
+security-report.json
