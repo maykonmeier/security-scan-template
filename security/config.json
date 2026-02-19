@@ -10,5 +10,34 @@
     "maxCritical": 0,
     "maxHigh": 5,
     "maxMedium": 20
-  }
+  },
+  "securityControls": [
+    {
+      "name": "Authentication",
+      "status": "active",
+      "items": [
+        "JWT with httpOnly cookies",
+        "Password hashing (bcrypt)",
+        "Session management"
+      ]
+    },
+    {
+      "name": "Authorization",
+      "status": "active",
+      "items": [
+        "Role-based access control",
+        "Route protection middleware",
+        "API endpoint validation"
+      ]
+    },
+    {
+      "name": "Data Protection",
+      "status": "active",
+      "items": [
+        "Input validation (Zod)",
+        "SQL injection prevention (ORM)",
+        "XSS protection"
+      ]
+    }
+  ]
 }
