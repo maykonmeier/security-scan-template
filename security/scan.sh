@@ -970,18 +970,39 @@ HTMLEOF
     sed -i '' "s|OWASP_A09_COLOR|$owasp_a09|g" "$OUTPUT_DIR/security-dashboard.html"
     sed -i '' "s|OWASP_A10_COLOR|$owasp_a10|g" "$OUTPUT_DIR/security-dashboard.html"
 
-    # Security controls
-    sed -i '' "s|SECURITY_CONTROLS_PLACEHOLDER|$controls_html|g" "$OUTPUT_DIR/security-dashboard.html"
+    # Security controls - write to temp file and use perl
+    local controls_file=$(mktemp)
+    echo "$controls_html" > "$controls_file"
+    perl -i -pe "
+        BEGIN { local \$/; open F, '$controls_file'; \$r = <F>; close F; chomp \$r; }
+        s|SECURITY_CONTROLS_PLACEHOLDER|\$r|g;
+    " "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
+    rm -f "$controls_file"
 
-    # Output details (escape for sed)
-    local audit_escaped=$(echo "$audit_html" | sed 's/[&/\]/\\&/g' | tr '\n' '\001')
-    local semgrep_escaped=$(echo "$semgrep_html" | sed 's/[&/\]/\\&/g' | tr '\n' '\001')
-    local test_escaped=$(echo "$test_html" | sed 's/[&/\]/\\&/g' | tr '\n' '\001')
+    # Output details - write to temp files for perl
+    local audit_file=$(mktemp)
+    local semgrep_file=$(mktemp)
+    local test_file=$(mktemp)
+    echo "$audit_html" > "$audit_file"
+    echo "$semgrep_html" > "$semgrep_file"
+    echo "$test_html" > "$test_file"
 
-    # Use perl for multiline replacement
-    perl -i -pe "s|AUDIT_OUTPUT_PLACEHOLDER|$audit_html|g" "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
-    perl -i -pe "s|SEMGREP_OUTPUT_PLACEHOLDER|$semgrep_html|g" "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
-    perl -i -pe "s|TEST_OUTPUT_PLACEHOLDER|$test_html|g" "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
+    perl -i -pe "
+        BEGIN { local \$/; open F, '$audit_file'; \$r = <F>; close F; chomp \$r; }
+        s|AUDIT_OUTPUT_PLACEHOLDER|\$r|g;
+    " "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
+
+    perl -i -pe "
+        BEGIN { local \$/; open F, '$semgrep_file'; \$r = <F>; close F; chomp \$r; }
+        s|SEMGREP_OUTPUT_PLACEHOLDER|\$r|g;
+    " "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
+
+    perl -i -pe "
+        BEGIN { local \$/; open F, '$test_file'; \$r = <F>; close F; chomp \$r; }
+        s|TEST_OUTPUT_PLACEHOLDER|\$r|g;
+    " "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
+
+    rm -f "$audit_file" "$semgrep_file" "$test_file"
 
     print_status "Dashboard generated: security-dashboard.html"
 }
