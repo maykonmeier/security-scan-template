@@ -6,6 +6,7 @@
 # Features:
 #   - Dependency Audit (SCA)
 #   - Static Analysis (SAST) with Semgrep
+#   - Dynamic Analysis (DAST) with Nuclei
 #   - OWASP Top 10 Checklist
 #   - Security Grade System (A+ to D)
 #   - Beautiful HTML Dashboard
@@ -45,6 +46,9 @@ OPEN_DASHBOARD=true
 MAX_CRITICAL=0
 MAX_HIGH=5
 MAX_MEDIUM=20
+DAST_ENABLED=false
+DAST_TARGET=""
+DAST_PORT=3000
 
 # ==============================================================================
 # Helper Functions
@@ -82,10 +86,12 @@ Usage:
     bash security/scan.sh [options]
 
 Options:
-    --ci          Run in CI mode (no browser, exit codes based on thresholds)
-    --json-only   Only generate JSON report, skip HTML dashboard
-    --no-tests    Skip running tests
-    --help        Show this help message
+    --ci            Run in CI mode (no browser, exit codes based on thresholds)
+    --json-only     Only generate JSON report, skip HTML dashboard
+    --no-tests      Skip running tests
+    --dast [URL]    Run DAST scan with Nuclei (requires running server)
+                    URL defaults to http://localhost:3000
+    --help          Show this help message
 
 Configuration:
     Edit security/config.json to customize:
@@ -96,8 +102,10 @@ Configuration:
     - securityControls: Custom security controls to display
 
 Examples:
-    bash security/scan.sh           # Run locally, open dashboard
-    bash security/scan.sh --ci      # Run in CI, check thresholds
+    bash security/scan.sh              # Run locally, open dashboard
+    bash security/scan.sh --ci         # Run in CI, check thresholds
+    bash security/scan.sh --dast       # Include DAST scan (localhost:3000)
+    bash security/scan.sh --dast http://staging.example.com  # DAST on custom URL
 
 EOF
     exit 0
@@ -392,14 +400,128 @@ run_tests() {
 }
 
 # ==============================================================================
+# Run DAST (Nuclei)
+# ==============================================================================
+
+run_dast() {
+    if [[ "$DAST_ENABLED" != "true" ]]; then
+        DAST_STATUS="skipped"
+        DAST_TEMPLATES=0
+        DAST_REQUESTS=0
+        DAST_CRITICAL=0
+        DAST_HIGH=0
+        DAST_MEDIUM=0
+        DAST_LOW=0
+        DAST_OUTPUT="DAST scan not enabled. Use --dast flag to enable."
+        return
+    fi
+
+    print_header "🌐 Dynamic Application Security Testing (DAST)"
+
+    if ! command -v nuclei &> /dev/null; then
+        print_warning "Nuclei not installed. Install with: brew install nuclei"
+        DAST_STATUS="not_installed"
+        DAST_TEMPLATES=0
+        DAST_REQUESTS=0
+        DAST_CRITICAL=0
+        DAST_HIGH=0
+        DAST_MEDIUM=0
+        DAST_LOW=0
+        DAST_OUTPUT="Nuclei not installed"
+        return
+    fi
+
+    # Check if target is reachable
+    local target="${DAST_TARGET:-http://localhost:$DAST_PORT}"
+    print_status "Target: $target"
+
+    if ! curl -s -o /dev/null -w "%{http_code}" "$target" | grep -qE "^[23]"; then
+        print_warning "Target not reachable: $target"
+        print_warning "Make sure your application is running"
+        DAST_STATUS="unreachable"
+        DAST_TEMPLATES=0
+        DAST_REQUESTS=0
+        DAST_CRITICAL=0
+        DAST_HIGH=0
+        DAST_MEDIUM=0
+        DAST_LOW=0
+        DAST_OUTPUT="Target unreachable: $target"
+        return
+    fi
+
+    print_status "Target is reachable"
+
+    # Update templates if needed
+    nuclei -update-templates -silent 2>/dev/null || true
+
+    # Run nuclei scan
+    local nuclei_output_file=$(mktemp)
+    local nuclei_json_file=$(mktemp)
+
+    print_status "Running Nuclei scan (this may take a few minutes)..."
+
+    nuclei -u "$target" \
+        -t ~/nuclei-templates/http/vulnerabilities \
+        -t ~/nuclei-templates/http/cves \
+        -t ~/nuclei-templates/dast \
+        -severity critical,high,medium,low \
+        -silent \
+        -jsonl -o "$nuclei_json_file" \
+        2>"$nuclei_output_file" || true
+
+    # Parse results
+    DAST_CRITICAL=0
+    DAST_HIGH=0
+    DAST_MEDIUM=0
+    DAST_LOW=0
+
+    if [[ -f "$nuclei_json_file" ]]; then
+        DAST_CRITICAL=$(grep -c '"severity":"critical"' "$nuclei_json_file" 2>/dev/null || echo "0")
+        DAST_HIGH=$(grep -c '"severity":"high"' "$nuclei_json_file" 2>/dev/null || echo "0")
+        DAST_MEDIUM=$(grep -c '"severity":"medium"' "$nuclei_json_file" 2>/dev/null || echo "0")
+        DAST_LOW=$(grep -c '"severity":"low"' "$nuclei_json_file" 2>/dev/null || echo "0")
+    fi
+
+    DAST_CRITICAL=$(sanitize_number "$DAST_CRITICAL")
+    DAST_HIGH=$(sanitize_number "$DAST_HIGH")
+    DAST_MEDIUM=$(sanitize_number "$DAST_MEDIUM")
+    DAST_LOW=$(sanitize_number "$DAST_LOW")
+
+    # Parse stats from output
+    DAST_TEMPLATES=$(grep -oE 'Templates: [0-9]+' "$nuclei_output_file" | tail -1 | grep -oE '[0-9]+' || echo "0")
+    DAST_REQUESTS=$(grep -oE 'Requests: [0-9]+' "$nuclei_output_file" | tail -1 | grep -oE '[0-9]+' || echo "0")
+
+    DAST_TEMPLATES=$(sanitize_number "$DAST_TEMPLATES")
+    DAST_REQUESTS=$(sanitize_number "$DAST_REQUESTS")
+
+    # Store output
+    DAST_OUTPUT=$(cat "$nuclei_output_file" 2>/dev/null || echo "No output")
+
+    # Determine status
+    local total_dast=$((DAST_CRITICAL + DAST_HIGH + DAST_MEDIUM + DAST_LOW))
+    if [[ $total_dast -eq 0 ]]; then
+        DAST_STATUS="passed"
+        print_status "No vulnerabilities found"
+    else
+        DAST_STATUS="findings"
+        print_warning "Found $total_dast vulnerabilities"
+    fi
+
+    # Cleanup
+    rm -f "$nuclei_output_file" "$nuclei_json_file"
+
+    print_status "DAST complete: $DAST_CRITICAL critical, $DAST_HIGH high, $DAST_MEDIUM medium, $DAST_LOW low"
+}
+
+# ==============================================================================
 # Calculate Security Score and Grade
 # ==============================================================================
 
 calculate_score() {
-    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL))
-    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH))
-    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM))
-    local total_low=$((AUDIT_LOW + SEMGREP_LOW))
+    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL + DAST_CRITICAL))
+    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH + DAST_HIGH))
+    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM + DAST_MEDIUM))
+    local total_low=$((AUDIT_LOW + SEMGREP_LOW + DAST_LOW))
 
     # Base score 100, subtract for vulnerabilities
     SECURITY_SCORE=$((100 - (total_critical * 25) - (total_high * 10) - (total_medium * 3) - (total_low * 1)))
@@ -803,25 +925,49 @@ except Exception as e:
             </div>
         </div>
 
-        <!-- DAST Placeholder -->
-        <div class="mb-8 bg-gray-800 rounded-xl p-6 border border-gray-700 border-dashed">
+        <!-- DAST Section -->
+        <div class="mb-8 bg-gray-800 rounded-xl p-6 border border-gray-700 DAST_BORDER_CLASS">
             <h3 class="text-lg font-semibold mb-4 flex items-center gap-2">
                 <span class="text-2xl">🌐</span>
                 Dynamic Application Security Testing (DAST)
-                <span class="ml-auto px-2 py-1 rounded text-xs bg-gray-500/20 text-gray-400">
-                    Not Configured
+                <span class="ml-auto px-2 py-1 rounded text-xs DAST_STATUS_CLASS">
+                    DAST_STATUS_TEXT
                 </span>
             </h3>
-            <p class="text-gray-400 text-sm">
-                DAST scans your running application for vulnerabilities. Configure OWASP ZAP or similar tools for runtime security testing.
-            </p>
-            <div class="mt-4 flex gap-3">
-                <a href="https://www.zaproxy.org/" target="_blank" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition">
-                    OWASP ZAP →
-                </a>
-                <a href="https://docs.github.com/en/code-security/code-scanning/integrating-with-code-scanning/using-code-scanning-with-your-ci-system" target="_blank" class="px-4 py-2 bg-gray-700 hover:bg-gray-600 rounded-lg text-sm transition">
-                    GitHub Code Scanning →
-                </a>
+            <div class="DAST_CONTENT_CLASS">
+                <div class="grid grid-cols-4 gap-4 mb-4">
+                    <div class="text-center p-3 bg-gray-700/50 rounded-lg">
+                        <p class="text-2xl font-bold text-red-400">DAST_CRITICAL</p>
+                        <p class="text-xs text-gray-400">Critical</p>
+                    </div>
+                    <div class="text-center p-3 bg-gray-700/50 rounded-lg">
+                        <p class="text-2xl font-bold text-orange-400">DAST_HIGH</p>
+                        <p class="text-xs text-gray-400">High</p>
+                    </div>
+                    <div class="text-center p-3 bg-gray-700/50 rounded-lg">
+                        <p class="text-2xl font-bold text-yellow-400">DAST_MEDIUM</p>
+                        <p class="text-xs text-gray-400">Medium</p>
+                    </div>
+                    <div class="text-center p-3 bg-gray-700/50 rounded-lg">
+                        <p class="text-2xl font-bold text-green-400">DAST_LOW</p>
+                        <p class="text-xs text-gray-400">Low</p>
+                    </div>
+                </div>
+                <div class="flex gap-4 text-sm text-gray-400 mb-4">
+                    <span>📋 DAST_TEMPLATES templates</span>
+                    <span>🔗 DAST_REQUESTS requests</span>
+                    <span>🎯 DAST_TARGET_DISPLAY</span>
+                </div>
+                <details class="mt-4">
+                    <summary class="cursor-pointer text-sm text-gray-400 hover:text-gray-300">View Details</summary>
+                    <pre class="mt-2 bg-gray-900 rounded-lg p-4 text-xs text-gray-300 overflow-x-auto max-h-48 overflow-y-auto">DAST_OUTPUT_PLACEHOLDER</pre>
+                </details>
+            </div>
+            <div class="DAST_PLACEHOLDER_CLASS">
+                <p class="text-gray-400 text-sm mb-4">
+                    DAST scans your running application for vulnerabilities. Use --dast flag to enable.
+                </p>
+                <code class="text-sm bg-gray-700 px-3 py-2 rounded">bash security/scan.sh --dast</code>
             </div>
         </div>
 
@@ -970,6 +1116,38 @@ HTMLEOF
     sed -i '' "s|OWASP_A09_COLOR|$owasp_a09|g" "$OUTPUT_DIR/security-dashboard.html"
     sed -i '' "s|OWASP_A10_COLOR|$owasp_a10|g" "$OUTPUT_DIR/security-dashboard.html"
 
+    # DAST replacements
+    sed -i '' "s|DAST_CRITICAL|$DAST_CRITICAL|g" "$OUTPUT_DIR/security-dashboard.html"
+    sed -i '' "s|DAST_HIGH|$DAST_HIGH|g" "$OUTPUT_DIR/security-dashboard.html"
+    sed -i '' "s|DAST_MEDIUM|$DAST_MEDIUM|g" "$OUTPUT_DIR/security-dashboard.html"
+    sed -i '' "s|DAST_LOW|$DAST_LOW|g" "$OUTPUT_DIR/security-dashboard.html"
+    sed -i '' "s|DAST_TEMPLATES|$DAST_TEMPLATES|g" "$OUTPUT_DIR/security-dashboard.html"
+    sed -i '' "s|DAST_REQUESTS|$DAST_REQUESTS|g" "$OUTPUT_DIR/security-dashboard.html"
+    sed -i '' "s|DAST_TARGET_DISPLAY|${DAST_TARGET:-localhost:$DAST_PORT}|g" "$OUTPUT_DIR/security-dashboard.html"
+
+    # DAST status and visibility
+    if [[ "$DAST_ENABLED" == "true" ]]; then
+        if [[ "$DAST_STATUS" == "passed" ]]; then
+            sed -i '' "s|DAST_STATUS_CLASS|bg-green-500/20 text-green-400|g" "$OUTPUT_DIR/security-dashboard.html"
+            sed -i '' "s|DAST_STATUS_TEXT|Passed|g" "$OUTPUT_DIR/security-dashboard.html"
+        elif [[ "$DAST_STATUS" == "findings" ]]; then
+            sed -i '' "s|DAST_STATUS_CLASS|bg-red-500/20 text-red-400|g" "$OUTPUT_DIR/security-dashboard.html"
+            sed -i '' "s|DAST_STATUS_TEXT|Issues Found|g" "$OUTPUT_DIR/security-dashboard.html"
+        else
+            sed -i '' "s|DAST_STATUS_CLASS|bg-yellow-500/20 text-yellow-400|g" "$OUTPUT_DIR/security-dashboard.html"
+            sed -i '' "s|DAST_STATUS_TEXT|$DAST_STATUS|g" "$OUTPUT_DIR/security-dashboard.html"
+        fi
+        sed -i '' "s|DAST_BORDER_CLASS||g" "$OUTPUT_DIR/security-dashboard.html"
+        sed -i '' "s|DAST_CONTENT_CLASS||g" "$OUTPUT_DIR/security-dashboard.html"
+        sed -i '' "s|DAST_PLACEHOLDER_CLASS|hidden|g" "$OUTPUT_DIR/security-dashboard.html"
+    else
+        sed -i '' "s|DAST_STATUS_CLASS|bg-gray-500/20 text-gray-400|g" "$OUTPUT_DIR/security-dashboard.html"
+        sed -i '' "s|DAST_STATUS_TEXT|Not Enabled|g" "$OUTPUT_DIR/security-dashboard.html"
+        sed -i '' "s|DAST_BORDER_CLASS|border-dashed|g" "$OUTPUT_DIR/security-dashboard.html"
+        sed -i '' "s|DAST_CONTENT_CLASS|hidden|g" "$OUTPUT_DIR/security-dashboard.html"
+        sed -i '' "s|DAST_PLACEHOLDER_CLASS||g" "$OUTPUT_DIR/security-dashboard.html"
+    fi
+
     # Security controls - write to temp file and use perl
     local controls_file=$(mktemp)
     echo "$controls_html" > "$controls_file"
@@ -1002,7 +1180,16 @@ HTMLEOF
         s|TEST_OUTPUT_PLACEHOLDER|\$r|g;
     " "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
 
-    rm -f "$audit_file" "$semgrep_file" "$test_file"
+    # DAST output
+    local dast_file=$(mktemp)
+    local dast_html=$(echo "$DAST_OUTPUT" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g; s/"/\&quot;/g')
+    echo "$dast_html" > "$dast_file"
+    perl -i -pe "
+        BEGIN { local \$/; open F, '$dast_file'; \$r = <F>; close F; chomp \$r; }
+        s|DAST_OUTPUT_PLACEHOLDER|\$r|g;
+    " "$OUTPUT_DIR/security-dashboard.html" 2>/dev/null || true
+
+    rm -f "$audit_file" "$semgrep_file" "$test_file" "$dast_file"
 
     print_status "Dashboard generated: security-dashboard.html"
 }
@@ -1016,10 +1203,10 @@ generate_json_report() {
         return
     fi
 
-    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL))
-    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH))
-    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM))
-    local total_low=$((AUDIT_LOW + SEMGREP_LOW))
+    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL + DAST_CRITICAL))
+    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH + DAST_HIGH))
+    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM + DAST_MEDIUM))
+    local total_low=$((AUDIT_LOW + SEMGREP_LOW + DAST_LOW))
 
     cat > "$OUTPUT_DIR/security-report.json" << EOF
 {
@@ -1049,6 +1236,18 @@ generate_json_report() {
     "medium": $SEMGREP_MEDIUM,
     "low": $SEMGREP_LOW
   },
+  "dast": {
+    "enabled": $DAST_ENABLED,
+    "tool": "nuclei",
+    "target": "${DAST_TARGET:-http://localhost:$DAST_PORT}",
+    "status": "$DAST_STATUS",
+    "templates": $DAST_TEMPLATES,
+    "requests": $DAST_REQUESTS,
+    "critical": $DAST_CRITICAL,
+    "high": $DAST_HIGH,
+    "medium": $DAST_MEDIUM,
+    "low": $DAST_LOW
+  },
   "tests": {
     "status": "$TEST_STATUS",
     "passed": $TEST_PASSED,
@@ -1071,9 +1270,9 @@ EOF
 # ==============================================================================
 
 check_thresholds() {
-    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL))
-    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH))
-    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM))
+    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL + DAST_CRITICAL))
+    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH + DAST_HIGH))
+    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM + DAST_MEDIUM))
 
     local exit_code=0
 
@@ -1142,6 +1341,15 @@ main() {
                 SKIP_TESTS=true
                 shift
                 ;;
+            --dast)
+                DAST_ENABLED=true
+                shift
+                # Check if next argument is a URL (not starting with --)
+                if [[ $# -gt 0 && ! "$1" =~ ^-- ]]; then
+                    DAST_TARGET="$1"
+                    shift
+                fi
+                ;;
             --help|-h)
                 show_help
                 ;;
@@ -1179,6 +1387,14 @@ main() {
     NODE_VERSION="unknown"
     FRAMEWORK_INFO=""
     DETECTED_FRAMEWORK="Node.js"
+    DAST_OUTPUT=""
+    DAST_STATUS="skipped"
+    DAST_TEMPLATES=0
+    DAST_REQUESTS=0
+    DAST_CRITICAL=0
+    DAST_HIGH=0
+    DAST_MEDIUM=0
+    DAST_LOW=0
 
     # Load configuration
     load_config
@@ -1190,6 +1406,7 @@ main() {
     run_audit
     run_semgrep
     run_tests
+    run_dast
 
     # Calculate score
     calculate_score
@@ -1204,10 +1421,10 @@ main() {
     # Final summary
     print_header "📋 Summary"
 
-    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL))
-    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH))
-    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM))
-    local total_low=$((AUDIT_LOW + SEMGREP_LOW))
+    local total_critical=$((AUDIT_CRITICAL + SEMGREP_CRITICAL + DAST_CRITICAL))
+    local total_high=$((AUDIT_HIGH + SEMGREP_HIGH + DAST_HIGH))
+    local total_medium=$((AUDIT_MEDIUM + SEMGREP_MEDIUM + DAST_MEDIUM))
+    local total_low=$((AUDIT_LOW + SEMGREP_LOW + DAST_LOW))
 
     echo -e "Grade:    ${GREEN}$GRADE${NC} ($SECURITY_SCORE/100)"
     echo ""
@@ -1216,6 +1433,9 @@ main() {
     echo -e "Medium:   ${YELLOW}$total_medium${NC} (threshold: $MAX_MEDIUM)"
     echo -e "Low:      ${GREEN}$total_low${NC}"
     echo -e "Tests:    $TEST_PASSED passed, $TEST_FAILED failed"
+    if [[ "$DAST_ENABLED" == "true" ]]; then
+        echo -e "DAST:     $DAST_STATUS ($DAST_TEMPLATES templates)"
+    fi
     echo ""
 
     if [[ "$CI_MODE" == "true" ]]; then
